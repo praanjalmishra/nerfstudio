@@ -28,6 +28,7 @@ from nerfstudio.utils import io
 
 def record3d_to_json(
     images_paths: List[Path],
+    depth_paths: List[Path],
     metadata_path: Path,
     output_dir: Path,
     indices: np.ndarray,
@@ -38,6 +39,7 @@ def record3d_to_json(
 
     Args:
         images_paths: list of image paths.
+        depth_paths: list of depth paths.
         metadata_path: Path to the Record3D metadata JSON file.
         output_dir: Path to the output directory.
         indices: Indices to sample the metadata_path. Should be the same length as images_paths.
@@ -48,6 +50,8 @@ def record3d_to_json(
     """
 
     assert len(images_paths) == len(indices)
+    assert len(depth_paths) == len(indices)
+
 
     metadata_dict = io.load_from_json(metadata_path)
 
@@ -65,10 +69,11 @@ def record3d_to_json(
     camera_to_worlds = np.concatenate([camera_to_worlds, homogeneous_coord], -2)
 
     frames = []
-    for i, im_path in enumerate(images_paths):
+    for i, (im_path, depth_path) in enumerate(zip(images_paths, depth_paths)):
         c2w = camera_to_worlds[i]
         frame = {
             "file_path": im_path.as_posix(),
+            "depth_file_path": depth_path.as_posix(),
             "transform_matrix": c2w.tolist(),
         }
         frames.append(frame)
@@ -92,6 +97,7 @@ def record3d_to_json(
         "w": W,
         "h": H,
         "camera_model": CAMERA_MODELS["perspective"].name,
+        "has_depth": True,
     }
 
     out["frames"] = frames
@@ -112,6 +118,8 @@ def record3d_to_json(
         pcd.points = o3d.utility.Vector3dVector(points3D)
         o3d.io.write_point_cloud(str(output_dir / "sparse_pc.ply"), pcd, write_ascii=True)
         out["ply_file_path"] = "sparse_pc.ply"
+
+    out["depth_scale"] = 1.0
 
     with open(output_dir / "transforms.json", "w", encoding="utf-8") as f:
         json.dump(out, f, indent=4)

@@ -23,7 +23,11 @@ from typing import Optional, Union
 
 import numpy as np
 import tyro
+import OpenEXR
+import Imath
+import array
 from typing_extensions import Annotated
+from PIL import Image 
 
 from nerfstudio.process_data import (
     metashape_utils,
@@ -61,6 +65,53 @@ class ProcessRecord3D(BaseConverterToNerfstudioDataset):
     """Max number of images to train on. If the dataset has more, images will be sampled approximately evenly. If -1,
     use all images."""
 
+    depth_dir: Optional[Path] = None
+
+    def exr_to_numpy(self, exr_path):
+        """Convert EXR file to numpy array."""
+        file = OpenEXR.InputFile(str(exr_path))
+        dw = file.header()['dataWindow']
+        size = (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1)
+        
+        # Extract channel names
+        channels = file.header()['channels'].keys()
+        # CONSOLE.print(f"Available channels: {list(channels)}")
+        
+        # Use R channel for depth
+        depth_channel = 'R'
+        # CONSOLE.print(f"Using depth channel: {depth_channel}")
+        
+        # Get pixel data
+        pt = Imath.PixelType(Imath.PixelType.FLOAT)
+        depth_str = file.channel(depth_channel, pt)
+        
+        # Convert to numpy array
+        depth_arr = np.array(array.array('f', depth_str))
+        depth_arr = depth_arr.reshape(size[1], size[0])
+        
+        # Print depth statistics
+        # CONSOLE.print(f"Depth Statistics:")
+        # CONSOLE.print(f"  Min depth: {depth_arr.min():.4f}")
+        # CONSOLE.print(f"  Max depth: {depth_arr.max():.4f}")
+        # CONSOLE.print(f"  Mean depth: {depth_arr.mean():.4f}")
+        # CONSOLE.print(f"  Std deviation: {depth_arr.std():.4f}")
+        
+        return depth_arr
+    
+    def upsample_depth(self, depth_array, target_width, target_height):
+        """Upsample depth array to target dimensions using PIL's nearest neighbor interpolation."""
+        # Convert numpy array to PIL Image
+        depth_img = Image.fromarray(depth_array.astype(np.float32))
+        
+        # Resize using NEAREST resampling (W, H order for PIL)
+        target_size = (target_width, target_height)
+        resized_img = depth_img.resize(target_size, resample=Image.NEAREST)
+        
+        # Convert back to numpy array
+        upsampled = np.array(resized_img)
+        
+        return upsampled
+
     def main(self) -> None:
         """Process images into a nerfstudio dataset."""
 
@@ -68,12 +119,21 @@ class ProcessRecord3D(BaseConverterToNerfstudioDataset):
         image_dir = self.output_dir / "images"
         image_dir.mkdir(parents=True, exist_ok=True)
 
+        depth_dir = self.output_dir / "depth"
+        depth_dir.mkdir(parents=True, exist_ok=True)
+
+
         summary_log = []
 
         record3d_image_dir = self.data / "rgb"
+        record3d_depth_dir = self.data / "depth" if self.depth_dir is None else self.depth_dir
+
 
         if not record3d_image_dir.exists():
             raise ValueError(f"Image directory {record3d_image_dir} doesn't exist")
+        
+        if not record3d_depth_dir.exists():
+            raise ValueError(f"Depth directory {record3d_depth_dir} doesn't exist")
 
         record3d_image_filenames = []
         for f in record3d_image_dir.iterdir():
@@ -82,12 +142,24 @@ class ProcessRecord3D(BaseConverterToNerfstudioDataset):
                     record3d_image_filenames.append(f)
 
         record3d_image_filenames = sorted(record3d_image_filenames, key=lambda fn: int(fn.stem))
+
+        # depth
+        record3d_depth_filenames = []
+        for f in record3d_depth_dir.iterdir():
+            if f.stem.isdigit():
+                if f.suffix.lower() == ".exr":
+                    record3d_depth_filenames.append(f)
+        
+        record3d_depth_filenames = sorted(record3d_depth_filenames, key=lambda fn: int(fn.stem))
+        
         num_images = len(record3d_image_filenames)
         idx = np.arange(num_images)
         if self.max_dataset_size != -1 and num_images > self.max_dataset_size:
             idx = np.round(np.linspace(0, num_images - 1, self.max_dataset_size)).astype(int)
 
         record3d_image_filenames = list(np.array(record3d_image_filenames)[idx])
+        record3d_depth_filenames = list(np.array(record3d_depth_filenames)[idx])
+
         # Copy images to output directory
         copied_image_paths = process_data_utils.copy_images_list(
             record3d_image_filenames,
@@ -95,9 +167,50 @@ class ProcessRecord3D(BaseConverterToNerfstudioDataset):
             verbose=self.verbose,
             num_downscales=self.num_downscales,
         )
+
+        import cv2
+        rgb_sample = cv2.imread(str(record3d_image_filenames[0]))
+        rgb_height, rgb_width = rgb_sample.shape[:2]
+        CONSOLE.print(f"RGB Image Size: ({rgb_height}, {rgb_width}) — (H, W) format")
+
+        # Process and save depth files as NPY
+        copied_depth_paths = []
+        for i, depth_file in enumerate(record3d_depth_filenames):
+            #CONSOLE.print(f"Reading: {depth_file}")
+            
+            # Convert EXR to numpy array
+            depth_array = self.exr_to_numpy(depth_file)
+            #CONSOLE.print(f"Image size: {depth_array.shape}")
+            
+            # Upsample depth to match RGB dimensions
+            if depth_array.shape[0] != rgb_height or depth_array.shape[1] != rgb_width:
+                #CONSOLE.print(f"[⚠️] Mismatch: depth shape {depth_array.shape} vs RGB shape ({rgb_height}, {rgb_width})")
+                # Note: PIL wants (width, height) while numpy uses (height, width)
+                depth_array = self.upsample_depth(depth_array, rgb_width, rgb_height)
+                #CONSOLE.print(f"Upsampled depth to {depth_array.shape}")
+
+            corresponding_image_path = copied_image_paths[i]
+            image_stem = corresponding_image_path.stem
+            
+            # Create output path with same naming convention as images
+            output_depth_path = depth_dir / f"{image_stem}.npy"
+            
+            np.save(output_depth_path, depth_array)
+            copied_depth_paths.append(output_depth_path)
+            
+            if self.verbose and i % 10 == 0:
+                CONSOLE.print(f"[green]Processing depth {i+1}/{len(record3d_depth_filenames)}")
+
+        
+
+
+
         num_frames = len(copied_image_paths)
 
         copied_image_paths = [Path("images/" + copied_image_path.name) for copied_image_path in copied_image_paths]
+        copied_depth_paths = [Path("depth/" + copied_depth_path.name) for copied_depth_path in copied_depth_paths]
+
+
         summary_log.append(f"Used {num_frames} images out of {num_images} total")
         if self.max_dataset_size > 0:
             summary_log.append(
@@ -108,6 +221,7 @@ class ProcessRecord3D(BaseConverterToNerfstudioDataset):
         metadata_path = self.data / "metadata.json"
         record3d_utils.record3d_to_json(
             copied_image_paths,
+            copied_depth_paths,
             metadata_path,
             self.output_dir,
             indices=idx,
