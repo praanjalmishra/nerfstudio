@@ -196,23 +196,29 @@ class SplatfactoFinetuneModel(Model):
 
     def populate_modules(self):
         print("Populating Splatfacto model modules...")
+        print(f"=== DEBUG: Training Setup ===")
+        print(f"Number of training data: {self.num_train_data}")
+        print(f"=== END DEBUG ===")
+
         if "step" not in GLOBAL_BUFFER:
             GLOBAL_BUFFER["step"] = self.step = 0
-        means = torch.empty((0, 3)).float().cuda()
-        scales = torch.empty((0, 3)).float().cuda()
-        quats = torch.empty((0, 4)).float().cuda()
+        means = torch.zeros((1, 3)).float().cuda()  
+        scales = torch.zeros((1, 3)).float().cuda()
+        quats = torch.zeros((1, 4)).float().cuda()
         dim_sh = num_sh_bases(self.config.sh_degree)
-        features_dc = torch.empty((0, 3)).float().cuda()
-        features_rest = torch.empty((0, dim_sh-1, 3)).float().cuda()
-        opacities = torch.empty((0, 1)).float().cuda()
+        features_dc = torch.zeros((1, 3)).float().cuda()
+        features_rest = torch.zeros((1, dim_sh-1, 3)).float().cuda()
+        opacities = torch.zeros((1, 1)).float().cuda()
+        
+        # Convert to parameters
         self.gauss_params = torch.nn.ParameterDict(
             {
-                "means": means,
-                "scales": scales,
-                "quats": quats,
-                "features_dc": features_dc,
-                "features_rest": features_rest,
-                "opacities": opacities,
+                "means": torch.nn.Parameter(means),
+                "scales": torch.nn.Parameter(scales),
+                "quats": torch.nn.Parameter(quats),
+                "features_dc": torch.nn.Parameter(features_dc),
+                "features_rest": torch.nn.Parameter(features_rest),
+                "opacities": torch.nn.Parameter(opacities),
             }
         )
 
@@ -326,56 +332,94 @@ class SplatfactoFinetuneModel(Model):
     def opacities(self):
         return self.gauss_params["opacities"]
 
-    def load_state_dict(self, dict, **kwargs):  # type: ignore
-        # resize the parameters to match the new number of points
-
-        if self.config.obj_mask_file and self.training:
-            # Load the object mask and filter out gaussians that are not inside the object mask
+    def load_state_dict(self, dict, **kwargs):
+        print(f"!!! Loading state_dict, training={self.training}")
+        
+        # Always check if we need to do object-specific loading
+        needs_object_filtering = (
+            self.config.obj_mask_file is not None and 
+            "gauss_params.means" in dict and 
+            dict["gauss_params.means"].shape[0] > 1  # More than our placeholder size
+        )
+        
+        if needs_object_filtering:
+            print("!!! Detected object-filtered checkpoint, handling special loading...")
+            
+            # Load object mask (needed for both training and inference)
             if isinstance(self.config.obj_mask_file, Path):
                 self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
                 print(f"Loaded object mask from {self.config.obj_mask_file}")
-                
             else:
                 raise ValueError(f"Unknown type of obj_mask_file {self.config.obj_mask_file}")
-        obj_mask = self.obj_3d_seg.query(dict["gauss_params.means"].cuda()).cpu()
-        print(f"Gaussians inside object mask: {obj_mask.sum().item()}")
-        if obj_mask.sum() == 0:
-            CONSOLE.print("[red]No gaussians inside the object mask![/red]")
-            return
-        
-        pose = self.obj_3d_seg.pose_change
-        dict["gauss_params.means"][obj_mask], dict["gauss_params.quats"][obj_mask] = \
-            transform_gaussians(pose.cpu(), dict["gauss_params.means"][obj_mask], dict["gauss_params.quats"][obj_mask])
+            
+            # Handle backwards compatibility
+            if "means" in dict:
+                for p in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
+                    dict[f"gauss_params.{p}"] = dict[p]
+            
+            if self.training:
+                # TRAINING MODE: Filter and transform gaussians
+                print("!!! Training mode: filtering and transforming gaussians")
+                
+                self.obj_mask = self.obj_3d_seg.query(dict["gauss_params.means"].cuda()).cpu()
+                print(f"Gaussians inside object mask: {self.obj_mask.sum().item()}")
+                
+                if self.obj_mask.sum() == 0:
+                    CONSOLE.print("[red]No gaussians inside the object mask![/red]")
+                    return
+                
+                # Transform gaussians
+                pose = self.obj_3d_seg.pose_change
+                dict["gauss_params.means"][self.obj_mask], dict["gauss_params.quats"][self.obj_mask] = \
+                    transform_gaussians(pose.cpu(), dict["gauss_params.means"][self.obj_mask], dict["gauss_params.quats"][self.obj_mask])
 
+                # Filter to only object gaussians
+                filtered_data = {}
+                for name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
+                    filtered_data[name] = dict[f"gauss_params.{name}"][self.obj_mask]
+                
+                # Resize existing parameters IN-PLACE
+                for name, new_data in filtered_data.items():
+                    existing_param = self.gauss_params[name]
+                    existing_param.data = new_data.to(existing_param.device).detach()
+                    print(f"Resized {name}: {existing_param.shape}")
+                
+                # Store fixed gaussians
+                self.gauss_params_fixed = {}
+                non_obj_mask = ~self.obj_mask
+                for name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
+                    self.gauss_params_fixed[name] = dict[f"gauss_params.{name}"][non_obj_mask].to(self.device)
+                
+                print(f"[INFO] Loaded {filtered_data['means'].shape[0]} Gaussians for fine-tuning.")
+                
+            else:
+                # INFERENCE MODE: Load all gaussians directly
+                print("!!! Inference mode: loading all gaussians directly")
+                
+                # Resize model to match checkpoint size
+                checkpoint_size = dict["gauss_params.means"].shape[0]
+                print(f"Resizing model from {self.means.shape[0]} to {checkpoint_size} gaussians")
+                
+                for name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
+                    checkpoint_data = dict[f"gauss_params.{name}"]
+                    existing_param = self.gauss_params[name]
+                    existing_param.data = checkpoint_data.to(existing_param.device).detach()
+                    print(f"Loaded {name}: {existing_param.shape}")
+            
+            self.step = 0
+            
+        else:
+            # Normal loading (original checkpoint without object filtering)
+            print("!!! Normal checkpoint loading")
+            super().load_state_dict(dict, **kwargs)
+            self.step = 0
 
-
-
-
-
-
-
-
-
-        # self.step = 20000
-        if "means" in dict:
-            # For backwards compatibility, we remap the names of parameters from
-            # means->gauss_params.means since old checkpoints have that format
-            for p in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
-                dict[f"gauss_params.{p}"] = dict[p]
-
-        self.gauss_params_fixed = {}
-        for name, param in self.gauss_params.items():
-            self.gauss_params_fixed[name] = \
-                dict[f"gauss_params.{name}"].to(self.device)
-        
-        newp = dict["gauss_params.means"].shape[0]
-        for name, param in self.gauss_params.items():
-            old_shape = param.shape
-            new_shape = (newp,) + old_shape[1:]
-            self.gauss_params[name] = torch.nn.Parameter(torch.zeros(new_shape, device=self.device))
-        super().load_state_dict(dict, **kwargs)
-        for name, param in self.gauss_params_fixed.items():
-            print(name, param.requires_grad, param.shape)
+        # Debug info
+        print(f"=== FINAL STATE ===")
+        print(f"Gaussians loaded: {self.means.shape[0]}")
+        print(f"Fixed gaussians: {getattr(self, 'gauss_params_fixed', {}).get('means', torch.tensor([])).shape[0] if hasattr(self, 'gauss_params_fixed') else 0}")
+        print(f"Training mode: {self.training}")
+        print(f"=== END ===")
 
     def set_crop(self, crop_box: Optional[OrientedBox]):
         self.crop_box = crop_box
@@ -410,12 +454,18 @@ class SplatfactoFinetuneModel(Model):
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes
     ) -> List[TrainingCallback]:
+        # print("!!!Creating training callbacks for Splatfacto model")
+        trainer = training_callback_attributes.trainer
+        # print(f"!!! Trainer start_step: {getattr(trainer, '_start_step', 'not found')}")
+        # print(f"!!! Trainer max_iterations: {getattr(trainer.config, 'max_num_iterations', 'not found')}")
+        # print(f"!!! Training will run: {getattr(trainer.config, 'max_num_iterations', 0) - getattr(trainer, '_start_step', 0)} iterations")
+        
         cbs = []
         cbs.append(
             TrainingCallback(
                 [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
                 self.step_cb,
-                # args=[training_callback_attributes.optimizers],
+                args=[training_callback_attributes.optimizers],
             )
         )
         cbs.append(
@@ -426,8 +476,26 @@ class SplatfactoFinetuneModel(Model):
             )
         )
         return cbs
+    
+    def clear_optimizer_state(self, optimizers):
+        """Clear optimizer state after parameter resizing"""
+        # print("!!! Clearing optimizer state after parameter resizing...")
+        
+        for name, optimizer in optimizers.optimizers.items():
+            if name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
+                # Clear the optimizer state for this parameter group
+                for param_group in optimizer.param_groups:
+                    for param in param_group['params']:
+                        if param in optimizer.state:
+                            print(f"Clearing state for {name}")
+                            optimizer.state[param].clear()
+                            # Re-initialize the state
+                            optimizer.state[param] = {}
 
     def step_cb(self, optimizers: Optimizers, step):
+        # print(f"!!!Step callback: {step}")  
+        if step == 20000:  
+            self.clear_optimizer_state(optimizers)
         self.step = step
         self.optimizers = optimizers.optimizers
         self.schedulers = optimizers.schedulers
@@ -441,15 +509,31 @@ class SplatfactoFinetuneModel(Model):
         }
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
-        """Obtain the parameter groups for the optimizers
-
-        Returns:
-            Mapping of different parameter groups
-        """
+        """Obtain the parameter groups for the optimizers"""
+        
+        # # Check if we have actual parameters loaded
+        # if self.means.shape[0] == 0:
+        #     print("!!! WARNING: get_param_groups called with empty parameters!")
+        #     print("!!! This should happen after load_state_dict")
+        #     # Return minimal groups that will be updated later
+        #     return {"empty": []}
+        
         gps = self.get_gaussian_param_groups()
         if self.config.use_bilateral_grid:
             gps["bilateral_grid"] = list(self.bil_grids.parameters())
         self.camera_optimizer.get_param_groups(param_groups=gps)
+        
+        # # Debug the actual parameter counts
+        # print(f"=== DEBUG: Parameter Groups (After Loading) ===")
+        # for group_name, params in gps.items():
+        #     if params:
+        #         param_count = sum(p.numel() for p in params)
+        #         requires_grad = all(p.requires_grad for p in params)
+        #         print(f"Group '{group_name}': {len(params)} tensors, {param_count} params, requires_grad={requires_grad}")
+        #     else:
+        #         print(f"Group '{group_name}': EMPTY")
+        # print(f"=== END DEBUG ===")
+        
         return gps
 
     def _get_downscale_factor(self):
@@ -515,6 +599,8 @@ class SplatfactoFinetuneModel(Model):
         Returns:
             Outputs of model. (ie. rendered colors)
         """
+        # print(f"!!! get_outputs called at step {getattr(self, 'step', 'unknown')}")
+
         if not isinstance(camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
@@ -549,6 +635,27 @@ class SplatfactoFinetuneModel(Model):
             features_rest_crop = self.features_rest
             scales_crop = self.scales
             quats_crop = self.quats
+
+            if hasattr(self, "gauss_params_fixed") and self.training:
+                # print(f"!!! Combining {self.means.shape[0]} trainable + {self.gauss_params_fixed['means'].shape[0]} fixed gaussians")
+                
+                opacities_crop = torch.cat([opacities_crop, self.gauss_params_fixed["opacities"]], dim=0)
+                means_crop = torch.cat([means_crop, self.gauss_params_fixed["means"]], dim=0)
+                features_dc_crop = torch.cat([features_dc_crop, self.gauss_params_fixed["features_dc"]], dim=0)
+                features_rest_crop = torch.cat([features_rest_crop, self.gauss_params_fixed["features_rest"]], dim=0)
+                scales_crop = torch.cat([scales_crop, self.gauss_params_fixed["scales"]], dim=0)
+                quats_crop = torch.cat([quats_crop, self.gauss_params_fixed["quats"]], dim=0)
+            elif hasattr(self, "gauss_params_fixed"):
+                # During evaluation, also include fixed gaussians
+                # print(f"!!! (Eval) Combining {self.means.shape[0]} trainable + {self.gauss_params_fixed['means'].shape[0]} fixed gaussians")
+                
+                opacities_crop = torch.cat([opacities_crop, self.gauss_params_fixed["opacities"]], dim=0)
+                means_crop = torch.cat([means_crop, self.gauss_params_fixed["means"]], dim=0)
+                features_dc_crop = torch.cat([features_dc_crop, self.gauss_params_fixed["features_dc"]], dim=0)
+                features_rest_crop = torch.cat([features_rest_crop, self.gauss_params_fixed["features_rest"]], dim=0)
+                scales_crop = torch.cat([scales_crop, self.gauss_params_fixed["scales"]], dim=0)
+                quats_crop = torch.cat([quats_crop, self.gauss_params_fixed["quats"]], dim=0)
+
 
         colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
 
@@ -680,7 +787,8 @@ class SplatfactoFinetuneModel(Model):
             batch: ground truth batch corresponding to outputs
             metrics_dict: dictionary of metrics, some of which we can use for loss
         """
-        print("#######Computing loss dict for Splatfacto model...")
+        # print(f"!!! get_loss_dict called at step {getattr(self, 'step', 'unknown')}")
+        # print("#######Computing loss dict for Splatfacto model...")
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         pred_img = outputs["rgb"]
 
@@ -795,25 +903,184 @@ class SplatfactoFinetuneModel(Model):
 
         return metrics_dict, images_dict
     
-    def after_train(
-        self, training_callback_attributes: TrainingCallbackAttributes, optimizers: Optimizers, step: int
-    ):
-        """Called after each training iteration."""
-        print(f"After train step {step}")
-        if isinstance(self.strategy, DefaultStrategy):
-            self.strategy.after_train(
-                params=self.gauss_params,
-                optimizers=optimizers,
-                state=self.strategy_state,
-                step=self.step,
-                info=self.info,
-            )
-        elif isinstance(self.strategy, MCMCStrategy):
-            self.strategy.after_train(
-                params=self.gauss_params,
-                optimizers=optimizers,
-                state=self.strategy_state,
-                step=self.step,
-            )
-        else:
-            raise ValueError(f"Unknown strategy {self.strategy}")
+    # def after_train(
+    #     self, training_callback_attributes: TrainingCallbackAttributes, optimizers: Optimizers, step: int
+    # ):
+    #     """Called after each training iteration."""
+    #     print(f"After train step {step}")
+    #     if isinstance(self.strategy, DefaultStrategy):
+    #         self.strategy.after_train(
+    #             params=self.gauss_params,
+    #             optimizers=optimizers,
+    #             state=self.strategy_state,
+    #             step=self.step,
+    #             info=self.info,
+    #         )
+    #     elif isinstance(self.strategy, MCMCStrategy):
+    #         self.strategy.after_train(
+    #             params=self.gauss_params,
+    #             optimizers=optimizers,
+    #             state=self.strategy_state,
+    #             step=self.step,
+    #         )
+    #     else:
+    #         raise ValueError(f"Unknown strategy {self.strategy}")
+
+
+    def after_train(self, optimizers, *, step: int):
+        """Custom fine-tuning strategy focused on quality and stability"""
+        
+        if self.step % 200 == 0:
+            scale_exp = torch.exp(self.scales)
+            max_scale = scale_exp.max(dim=-1).values
+            min_scale = scale_exp.min(dim=-1).values
+            aspect_ratios = max_scale / min_scale
+            print(f"Step {self.step} | Gaussians: {self.num_points} | "
+                f"Opacity: {torch.sigmoid(self.opacities).mean().item():.3f} | "
+                f"Max aspect ratio: {aspect_ratios.max().item():.1f} | "
+                f"Mean aspect ratio: {aspect_ratios.mean().item():.1f}")
+
+        assert step == self.step
+
+        # Apply our custom fine-tuning strategy every 100 steps
+        if self.step % 100 == 0 and self.step > 0:
+            with torch.no_grad():
+                self._apply_finetuning_constraints(optimizers)
+        
+        # Reset opacities less frequently to maintain stability
+        # if self.step % 3000 == 0 and self.step > 0:
+        #     self._reset_opacities_gentle(optimizers)
+
+    def _apply_finetuning_constraints(self, optimizers):
+        """Apply constraints to prevent spikey gaussians and maintain quality"""
+        
+        scale_exp = torch.exp(self.scales)
+        num_before = self.num_points
+        
+        # 1. CULL EXTREMELY ELONGATED GAUSSIANS
+        max_scale = scale_exp.max(dim=-1).values
+        min_scale = scale_exp.min(dim=-1).values
+        aspect_ratios = max_scale / min_scale
+        
+        # Remove gaussians with extreme aspect ratios (these cause the spikes)
+        elongated_mask = aspect_ratios > 10.0
+        
+        # 2. CULL VERY LARGE GAUSSIANS
+        large_mask = max_scale > 0.1  # Adjust based on your scene scale
+        
+        # 3. CULL LOW OPACITY GAUSSIANS
+        low_opacity_mask = torch.sigmoid(self.opacities).squeeze() < 0.005
+        
+        # Skip object region check for now to avoid device issues
+        # outside_mask = torch.zeros_like(elongated_mask)
+        
+        # Combine culling criteria (without outside mask for now)
+        cull_mask = elongated_mask | large_mask | low_opacity_mask
+        
+        if cull_mask.sum() > 0:
+            print(f"    Culling {cull_mask.sum().item()} gaussians: "
+                f"{elongated_mask.sum().item()} elongated, "
+                f"{large_mask.sum().item()} large, "
+                f"{low_opacity_mask.sum().item()} low opacity")
+            
+            # Remove culled gaussians
+            for name, param in self.gauss_params.items():
+                self.gauss_params[name] = torch.nn.Parameter(param[~cull_mask])
+            
+            # Update optimizers
+            self.remove_from_all_optim(optimizers, cull_mask)
+        
+        # 5. REGULARIZE REMAINING GAUSSIAN SCALES
+        self._regularize_gaussian_scales()
+        
+        print(f"    Gaussians: {num_before} -> {self.num_points}")
+
+    def _regularize_gaussian_scales(self):
+        """Regularize gaussian scales to prevent extreme elongation"""
+        with torch.no_grad():
+            scale_exp = torch.exp(self.scales)
+            
+            # Clamp scales to reasonable range
+            min_scale = 0.001  # Minimum scale
+            max_scale = 0.05   # Maximum scale (adjust for your scene)
+            
+            scale_exp = torch.clamp(scale_exp, min_scale, max_scale)
+            
+            # Limit aspect ratios by bringing extreme scales closer together
+            max_scale_per_gaussian = scale_exp.max(dim=-1, keepdim=True).values
+            min_scale_per_gaussian = scale_exp.min(dim=-1, keepdim=True).values
+            aspect_ratio = max_scale_per_gaussian / min_scale_per_gaussian
+            
+            # If aspect ratio is too high, reduce the max scales
+            max_allowed_ratio = 5.0
+            too_elongated = aspect_ratio > max_allowed_ratio
+            
+            if too_elongated.any():
+                # Reduce the largest scale to maintain max ratio
+                target_max_scale = min_scale_per_gaussian * max_allowed_ratio
+                scale_exp = torch.where(
+                    too_elongated.expand_as(scale_exp),
+                    torch.minimum(scale_exp, target_max_scale.expand_as(scale_exp)),
+                    scale_exp
+                )
+            
+            # Update the parameters
+            self.scales.data = torch.log(scale_exp)
+
+    def _reset_opacities_gentle(self, optimizers):
+        """Gently reset opacities without being too aggressive"""
+        print(f"    Gentle opacity reset at step {self.step}")
+        
+        with torch.no_grad():
+            # Don't reset all opacities, just clamp very high ones
+            current_opacities = torch.sigmoid(self.opacities)
+            
+            # Reset only very high opacities (> 0.95) to avoid oversaturation
+            high_opacity_mask = current_opacities > 0.95
+            if high_opacity_mask.any():
+                # Reset high opacities to a more reasonable value
+                target_opacity = 0.8
+                self.opacities.data[high_opacity_mask] = torch.logit(
+                    torch.tensor(target_opacity, device=self.device)
+                )
+                print(f"    Reset {high_opacity_mask.sum().item()} high opacities")
+        
+        # Reset optimizer state for opacities
+        if "opacities" in optimizers.optimizers:
+            optim = optimizers.optimizers["opacities"]
+            if optim.param_groups and optim.param_groups[0]["params"]:
+                param = optim.param_groups[0]["params"][0]
+                if param in optim.state and "exp_avg" in optim.state[param]:
+                    optim.state[param]["exp_avg"] = torch.zeros_like(optim.state[param]["exp_avg"])
+                    optim.state[param]["exp_avg_sq"] = torch.zeros_like(optim.state[param]["exp_avg_sq"])
+
+    # You'll also need these helper methods from your original code:
+    def remove_from_all_optim(self, optimizers, deleted_mask):
+        """Remove deleted gaussians from all optimizers"""
+        param_groups = self.get_gaussian_param_groups()
+        for group, param in param_groups.items():
+            if group in optimizers.optimizers:
+                self.remove_from_optim(optimizers.optimizers[group], deleted_mask, param)
+        torch.cuda.empty_cache()
+
+    def remove_from_optim(self, optimizer, deleted_mask, new_params):
+        """Remove deleted gaussians from a specific optimizer"""
+        if not new_params:
+            return
+            
+        param = optimizer.param_groups[0]["params"][0]
+        param_state = optimizer.state.get(param, {})
+        
+        # Update state tensors
+        for state_key in ["exp_avg", "exp_avg_sq"]:
+            if state_key in param_state:
+                param_state[state_key] = param_state[state_key][~deleted_mask]
+        
+        # Update parameter groups
+        optimizer.param_groups[0]["params"] = new_params
+        
+        # Update state dict
+        if param in optimizer.state:
+            del optimizer.state[param]
+        if new_params:
+            optimizer.state[new_params[0]] = param_state
