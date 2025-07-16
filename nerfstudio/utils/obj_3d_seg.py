@@ -212,7 +212,7 @@ class Object3DSeg:
         voxel[under_object_mask] = True
         return voxel
 
-    def query(self, points, dilate=None, voxel=None):
+    def query(self, points, dilate=True, voxel=None):
         """
         Query the object 3D seg at points to determine whether they are inside
 
@@ -440,9 +440,28 @@ class Object3DSeg:
             mask_dilate_uniform=data['mask_dilate_uniform'],
             mask_dilate_top=data['mask_dilate_top']
         )
-        print(f"Succesfully loaded the scene change estimates")
+        # print(f"Succesfully loaded the scene change estimates")
+        # print(f"Bounding box min: {obj.bbox_min}")
+        # print(f"dilate uniform: {obj.mask_dilate_uniform}")
+        # print(f"dilate top: {obj.mask_dilate_top}")
         print(f"Pose change:\n {obj.pose_change}")
         return obj
+    
+    def refine_mask(self, dilate_k=2, erode_k=1):
+        """
+        Refine the voxel grid: Dilation followed by Erosion.
+        Helps preserve structure and fill small holes without over-growing.
+
+        Args:
+            dilate_k (int): Dilation kernel size.
+            erode_k (int): Erosion kernel size.
+        """
+        from scipy.ndimage import binary_erosion
+
+        voxel = self.dilate_uniform(dilate_k).cpu().numpy()
+        voxel = binary_erosion(voxel, iterations=erode_k)
+        self.voxel = torch.from_numpy(voxel).to(self.voxel.device)
+
     
     def visualize(self, output_dir):
         voxel = self.voxel.cpu().numpy()
